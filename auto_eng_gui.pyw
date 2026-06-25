@@ -14,7 +14,18 @@ from PIL import Image, ImageDraw
 import pyperclip
 import converter
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
+
+# quiet-utility 토큰 (표시·설정 창)
+UI_BG = "#f8f8f9"
+UI_TEXT = "#1f2328"
+UI_TEXT_MUTED = "#67696d"
+UI_ACCENT = "#526371"
+UI_ACCENT_SECONDARY = "#74c2b4"
+UI_BORDER = "#cecfd0"
+OVERLAY_HANGUL = UI_ACCENT_SECONDARY
+OVERLAY_ENGLISH = UI_ACCENT
+OVERLAY_UNKNOWN = UI_BORDER
 
 # --- Win32 API ---
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -1195,9 +1206,9 @@ class OverlayWidget:
         
         self.canvas = tk.Canvas(self.toplevel, width=14, height=14, bg=TRANS_COLOR, highlightthickness=0)
         self.canvas.pack()
-        self.circle = self.canvas.create_oval(1, 1, 13, 13, fill="#2196F3", outline=TRANS_COLOR)
-        self.square = self.canvas.create_rectangle(1, 1, 13, 13, fill="#F44336", outline=TRANS_COLOR)
-        self.triangle = self.canvas.create_polygon(7, 1, 1, 13, 13, 13, fill="#9E9E9E", outline=TRANS_COLOR)
+        self.circle = self.canvas.create_oval(1, 1, 13, 13, fill=OVERLAY_HANGUL, outline=TRANS_COLOR)
+        self.square = self.canvas.create_rectangle(1, 1, 13, 13, fill=OVERLAY_ENGLISH, outline=TRANS_COLOR)
+        self.triangle = self.canvas.create_polygon(7, 1, 1, 13, 13, 13, fill=OVERLAY_UNKNOWN, outline=TRANS_COLOR)
         self.canvas.itemconfig(self.square, state="hidden")
         self.canvas.itemconfig(self.triangle, state="hidden")
         
@@ -1307,9 +1318,9 @@ def create_triangle_image(color):
     draw.polygon([(32, 10), (10, 54), (54, 54)], fill=color, outline="white")
     return image
 
-ICON_HANGUL = create_circle_image("#2196F3")
-ICON_ENGLISH = create_square_image("#F44336")
-ICON_UNKNOWN = create_triangle_image("#9E9E9E")
+ICON_HANGUL = create_circle_image(OVERLAY_HANGUL)
+ICON_ENGLISH = create_square_image(OVERLAY_ENGLISH)
+ICON_UNKNOWN = create_triangle_image(OVERLAY_UNKNOWN)
 
 def _app_tray_title(status=""):
     base = f"자동 영타 전환기 v{APP_VERSION}"
@@ -1371,9 +1382,30 @@ def timer_thread():
                 timer_triggered = True
 
 # --- GUI ---
+def _apply_ui_theme(root):
+    style = ttk.Style(root)
+    try:
+        style.theme_use('clam')
+    except tk.TclError:
+        pass
+    root.configure(bg=UI_BG)
+    style.configure('.', background=UI_BG, foreground=UI_TEXT)
+    style.configure('TFrame', background=UI_BG)
+    style.configure('TLabel', background=UI_BG, foreground=UI_TEXT)
+    style.configure('Muted.TLabel', background=UI_BG, foreground=UI_TEXT_MUTED)
+    style.configure('Accent.TLabel', background=UI_BG, foreground=UI_ACCENT_SECONDARY)
+    style.configure('TLabelframe', background=UI_BG, bordercolor=UI_BORDER, relief='solid')
+    style.configure('TLabelframe.Label', background=UI_BG, foreground=UI_ACCENT, font=('Segoe UI', 9, 'bold'))
+    style.configure('TCheckbutton', background=UI_BG, foreground=UI_TEXT)
+    style.configure('TRadiobutton', background=UI_BG, foreground=UI_TEXT)
+    style.configure('Accent.TCheckbutton', background=UI_BG, foreground=UI_ACCENT, font=('Segoe UI', 10, 'bold'))
+    style.configure('TButton', padding=(10, 4))
+    style.configure('TEntry', fieldbackground='#ffffff')
+
 class AutoEngApp:
     def __init__(self, root):
         self.root = root
+        _apply_ui_theme(root)
         self.root.title(f"자동 영타 전환기 v{APP_VERSION}")
         self.root.geometry("480x720")
         self.root.minsize(420, 520)
@@ -1385,7 +1417,7 @@ class AutoEngApp:
         outer = ttk.Frame(root)
         outer.pack(fill='both', expand=True)
 
-        self._scroll_canvas = tk.Canvas(outer, highlightthickness=0)
+        self._scroll_canvas = tk.Canvas(outer, highlightthickness=0, bg=UI_BG, bd=0)
         vsb = ttk.Scrollbar(outer, orient='vertical', command=self._scroll_canvas.yview)
         self._scroll_canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side='right', fill='y')
@@ -1407,7 +1439,7 @@ class AutoEngApp:
         self._scroll_canvas.bind_all('<MouseWheel>', _on_mousewheel)
         
         self.var_enabled = tk.BooleanVar(value=app_state["enabled"])
-        chk_main = ttk.Checkbutton(content, text="기능 켜기 (전체 활성화)", variable=self.var_enabled, command=self.update_settings)
+        chk_main = ttk.Checkbutton(content, text="기능 켜기 (전체 활성화)", style='Accent.TCheckbutton', variable=self.var_enabled, command=self.update_settings)
         chk_main.pack(pady=10, padx=15, anchor='w')
         
         frame_enter = ttk.LabelFrame(content, text="엔터(Enter) 키 동작 설정")
@@ -1449,7 +1481,7 @@ class AutoEngApp:
         f_he_double = ttk.Frame(frame_haneng)
         f_he_double.pack(anchor='w', fill='x', padx=25, pady=(0, 5))
         self.var_double_lang = tk.StringVar()
-        ttk.Label(f_he_double, textvariable=self.var_double_lang, foreground="blue").pack(side='left')
+        ttk.Label(f_he_double, textvariable=self.var_double_lang, style='Accent.TLabel').pack(side='left')
         
         f_he_time = ttk.Frame(frame_haneng)
         f_he_time.pack(anchor='w', fill='x', padx=25, pady=(0, 10))
@@ -1463,7 +1495,7 @@ class AutoEngApp:
         frame_overlay.pack(fill='x', pady=5, padx=15)
         self.var_overlay_enabled = tk.BooleanVar(value=app_state.get("overlay_enabled", False))
         ttk.Checkbutton(frame_overlay, text="커서(마우스) 주변에 한/영 상태 아이콘 띄우기", variable=self.var_overlay_enabled, command=self.update_settings).pack(anchor='w', pady=5, padx=10)
-        ttk.Label(frame_overlay, text="한글: 파란 원 / 영어: 빨간 사각형 / 비활성·불명: 회색 삼각형", foreground="gray").pack(anchor='w', padx=25, pady=(0, 10))
+        ttk.Label(frame_overlay, text="한글: 청록 원 / 영어: 슬레이트 사각형 / 비활성·불명: 회색 삼각형", style='Muted.TLabel').pack(anchor='w', padx=25, pady=(0, 10))
 
         frame_target = ttk.LabelFrame(content, text="대상 프로그램 설정 (창 제목 기준)")
         frame_target.pack(fill='x', pady=5, padx=15)
