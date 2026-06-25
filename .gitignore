@@ -14,3 +14,8 @@ venv.bak/
 
 # App settings
 settings.json
+
+# Logs
+*.log
+debug-*.log
+typo_debug.log
