@@ -14,11 +14,12 @@ from PIL import Image, ImageDraw
 import pyperclip
 import converter
 
-APP_VERSION = "2.2.3"
+APP_VERSION = "2.2.8"
 
 # --- Win32 API ---
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 imm32 = ctypes.WinDLL('imm32', use_last_error=True)
+kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
 
 imm32.ImmGetContext.argtypes = [wintypes.HWND]
 imm32.ImmGetContext.restype = wintypes.HANDLE
@@ -33,6 +34,10 @@ imm32.ImmGetOpenStatus.restype = wintypes.BOOL
 
 user32.GetKeyState.argtypes = [ctypes.c_int]
 user32.GetKeyState.restype = ctypes.c_short
+
+kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+kernel32.CreateMutexW.restype = wintypes.HANDLE
+kernel32.GetLastError.restype = wintypes.DWORD
 
 user32.GetParent.restype = wintypes.HWND
 user32.GetParent.argtypes = [wintypes.HWND]
@@ -263,81 +268,161 @@ def _ime_hwnd_candidates_weighted():
         add(get_focused_hwnd(), 2)
     return items
 
+def _chrome_ime_hwnds_ordered():
+    """Chrome: 포커스 → 캐럿 → 마우스 아래 순 (첫 성공만 사용).
+    로그상 포커스 창 Imm가 가장 안정적이라 우선한다."""
+    hwnds = []
+    seen = set()
+
+    def add(hwnd):
+        if hwnd and hwnd not in seen and hwnd not in _overlay_exclude_hwnds:
+            seen.add(hwnd)
+            hwnds.append(hwnd)
+
+    fg = user32.GetForegroundWindow()
+    if fg:
+        gui_info = GUITHREADINFO()
+        gui_info.cbSize = ctypes.sizeof(GUITHREADINFO)
+        thread_id = user32.GetWindowThreadProcessId(fg, None)
+        if user32.GetGUIThreadInfo(thread_id, ctypes.byref(gui_info)):
+            add(gui_info.hwndFocus)
+            add(gui_info.hwndCaret)
+    add(get_focused_hwnd())
+    add(_hwnd_at_cursor())
+    return hwnds
+
+def _real_hangul_now():
+    """실제 IME 한/영 (Imm 기준). bool 또는 None."""
+    for hwnd in _chrome_ime_hwnds_ordered():
+        mode = _ime_mode_from_hwnd(hwnd)
+        if mode is not None:
+            return (mode & IME_CMODE_HANGUL) != 0
+    return None
+
+def _read_ime_hangul_imm_chrome():
+    readings = []
+    for hwnd in _chrome_ime_hwnds_ordered():
+        mode = _ime_mode_from_hwnd(hwnd)
+        if mode is not None:
+            readings.append((mode & IME_CMODE_HANGUL) != 0)
+    if not readings:
+        return None
+    if len(set(readings)) == 1:
+        return readings[0]
+    return readings[0]
+
 def _is_hangul_from_key_state():
     return (user32.GetKeyState(VK_HANGUL) & 1) != 0
 
 def _read_ime_hangul_imm():
-    """여러 HWND 가중 투표로 Imm 상태 판별."""
-    hangul_w = 0
-    english_w = 0
-    for hwnd, weight in _ime_hwnd_candidates_weighted():
-        mode = _ime_mode_from_hwnd(hwnd)
-        if mode is None:
-            continue
-        if (mode & IME_CMODE_HANGUL) != 0:
-            hangul_w += weight
+    """Chrome은 커서 우선 단일 읽기, 그 외는 가중 투표."""
+    global _ime_read_cache_at, _ime_read_cache_val
+    now = time.time()
+    if now - _ime_read_cache_at < IME_READ_CACHE_SEC:
+        return _ime_read_cache_val
+    if _is_chromium_foreground():
+        result = _read_ime_hangul_imm_chrome()
+    else:
+        hangul_w = 0
+        english_w = 0
+        for hwnd, weight in _ime_hwnd_candidates_weighted():
+            mode = _ime_mode_from_hwnd(hwnd)
+            if mode is None:
+                continue
+            if (mode & IME_CMODE_HANGUL) != 0:
+                hangul_w += weight
+            else:
+                english_w += weight
+        if hangul_w == 0 and english_w == 0:
+            result = None
+        elif hangul_w > english_w:
+            result = True
+        elif english_w > hangul_w:
+            result = False
         else:
-            english_w += weight
-    if hangul_w == 0 and english_w == 0:
-        return None
-    if hangul_w > english_w:
-        return True
-    if english_w > hangul_w:
-        return False
-    return hangul_w > 0
+            result = hangul_w > 0
+    _ime_read_cache_at = now
+    _ime_read_cache_val = result
+    return result
+
+def _invalidate_ime_read_cache():
+    global _ime_read_cache_at, _ime_read_cache_val
+    _ime_read_cache_at = 0.0
+    _ime_read_cache_val = None
 
 _ime_instant_state = None
 _ime_instant_until = 0.0
+_ime_instant_fg_hwnd = None
+_last_ime_fg_hwnd = None
+_ime_read_cache_at = 0.0
+_ime_read_cache_val = None
+IME_READ_CACHE_SEC = 0.05
 IME_OVERLAY_DEBOUNCE = 0.12
-IME_INSTANT_HOLD = 0.8
+IME_INSTANT_HOLD = 0.5
+
+def _sync_ime_foreground():
+    """창 전환 시 이전 앱의 instant 캐시 제거."""
+    global _last_ime_fg_hwnd, _ime_instant_state, _ime_instant_until, _ime_instant_fg_hwnd
+    fg = user32.GetForegroundWindow()
+    if fg != _last_ime_fg_hwnd:
+        _last_ime_fg_hwnd = fg
+        _ime_instant_state = None
+        _ime_instant_until = 0.0
+        _ime_instant_fg_hwnd = None
 
 def _apply_ime_instant_display(hangul):
-    """한/영 키 직후 표시 즉시 반영."""
-    global _ime_instant_state, _ime_instant_until
+    """한/영 키 직후 표시 즉시 반영 (현재 포그라운드 창에만 유효)."""
+    global _ime_instant_state, _ime_instant_until, _ime_instant_fg_hwnd
     _ime_instant_state = "hangul" if hangul else "english"
     _ime_instant_until = time.time() + IME_INSTANT_HOLD
+    _ime_instant_fg_hwnd = user32.GetForegroundWindow()
     update_tray_icon()
 
 def _schedule_ime_display_refresh_after_haneng():
-    """한/영 토글 후 Imm가 안정될 때까지 재읽기 (VK 조기 읽기로 반대 표시되는 문제 방지)."""
+    """한/영 토글 후 실제 IME(Imm) 기준 표시 반영."""
+    fg_at_press = user32.GetForegroundWindow()
+
     def _work():
-        vk_at_press = _is_hangul_from_key_state()
         for wait in (0.06, 0.10, 0.16):
             time.sleep(wait)
-            imm = _read_ime_hangul_imm()
-            vk = _is_hangul_from_key_state()
-            if imm is not None:
-                hangul = vk if (_is_chromium_foreground() and imm != vk) else imm
-                _apply_ime_instant_display(hangul)
-                if not _is_chromium_foreground() or imm == vk:
-                    return
-            elif wait >= 0.10:
-                hangul = vk if vk != vk_at_press else (not vk_at_press)
-                _apply_ime_instant_display(hangul)
+            if user32.GetForegroundWindow() != fg_at_press:
                 return
+            _invalidate_ime_read_cache()
+            rh = _real_hangul_now()
+            _apply_ime_instant_display(rh if rh is not None else _is_hangul_from_key_state())
+            return
     threading.Thread(target=_work, daemon=True).start()
 
 def _ime_overlay_debounce_sec():
-    if _ime_instant_state and time.time() < _ime_instant_until:
+    fg = user32.GetForegroundWindow()
+    if _ime_instant_state and time.time() < _ime_instant_until and fg == _ime_instant_fg_hwnd:
         return 0.0
     return IME_OVERLAY_DEBOUNCE
 
 def _resolve_ime_display_state():
-    """표시용: Imm 우선(일반 앱), Chrome만 Imm≠VK 시 VK, Imm 실패 시 unknown."""
-    global _ime_instant_state, _ime_instant_until
-    if _ime_instant_state and time.time() < _ime_instant_until:
+    """모든 앱 Imm(실제 IME) 기준, Imm 실패 시 unknown."""
+    global _ime_instant_state, _ime_instant_until, _ime_instant_fg_hwnd
+    _sync_ime_foreground()
+    fg = user32.GetForegroundWindow()
+    if (_ime_instant_state and time.time() < _ime_instant_until
+            and fg == _ime_instant_fg_hwnd):
         return _ime_instant_state
 
-    imm = _read_ime_hangul_imm()
-    vk = _is_hangul_from_key_state()
-    if imm is None:
-        return "unknown"
-    if _is_chromium_foreground() and imm != vk:
+    if _is_chromium_foreground():
         if _ime_instant_state:
             _ime_instant_state = None
-        return "hangul" if vk else "english"
+            _ime_instant_fg_hwnd = None
+        rh = _real_hangul_now()
+        if rh is None:
+            return "unknown"
+        return "hangul" if rh else "english"
+
+    imm = _read_ime_hangul_imm()
+    if imm is None:
+        return "unknown"
     if _ime_instant_state:
         _ime_instant_state = None
+        _ime_instant_fg_hwnd = None
     return "hangul" if imm else "english"
 
 def get_ime_display_state(check_active=True):
@@ -356,41 +441,56 @@ def is_hangul_mode():
         return hangul
     return _is_hangul_from_key_state()
 
+def _clear_ime_display_cache():
+    global _ime_instant_state, _ime_instant_until, _ime_instant_fg_hwnd
+    _ime_instant_state = None
+    _ime_instant_until = 0.0
+    _ime_instant_fg_hwnd = None
+    _invalidate_ime_read_cache()
+
 def set_ime_to_english():
-    try:
-        hwnd = get_focused_hwnd()
-        if not hwnd: return
-        hime_wnd = imm32.ImmGetDefaultIMEWnd(hwnd)
-        if not hime_wnd: return
-        current_mode = user32.SendMessageW(hime_wnd, WM_IME_CONTROL, IMC_GETCONVERSIONMODE, 0)
-        if current_mode & IME_CMODE_HANGUL:
-            new_mode = current_mode & ~IME_CMODE_HANGUL
-            user32.SendMessageW(hime_wnd, WM_IME_CONTROL, IMC_SETCONVERSIONMODE, new_mode)
-    except Exception as e:
-        pass
-        
-    # 크롬 등 SendMessage가 무시되는 앱을 위해, 상태 점검 후 안 바뀌었으면 물리적 한/영키 전송
-    time.sleep(0.02)
-    if is_hangul_mode():
+    """실제 IME(Imm)가 한글이면 영문으로 전환. SendMessage 우선, 미반영 시 si_tap."""
+    if _real_hangul_now() is False:
+        return
+    hwnd = get_focused_hwnd()
+    if hwnd:
+        try:
+            hime_wnd = imm32.ImmGetDefaultIMEWnd(hwnd)
+            if hime_wnd:
+                current_mode = user32.SendMessageW(hime_wnd, WM_IME_CONTROL, IMC_GETCONVERSIONMODE, 0)
+                if current_mode & IME_CMODE_HANGUL:
+                    new_mode = current_mode & ~IME_CMODE_HANGUL
+                    user32.SendMessageW(hime_wnd, WM_IME_CONTROL, IMC_SETCONVERSIONMODE, new_mode)
+        except Exception:
+            pass
+    time.sleep(0.03)
+    _invalidate_ime_read_cache()
+    if _real_hangul_now() is True:
         si_tap(0x15)
+        time.sleep(0.03)
+    _invalidate_ime_read_cache()
 
 def set_ime_to_hangul():
-    try:
-        hwnd = get_focused_hwnd()
-        if not hwnd: return
-        hime_wnd = imm32.ImmGetDefaultIMEWnd(hwnd)
-        if not hime_wnd: return
-        current_mode = user32.SendMessageW(hime_wnd, WM_IME_CONTROL, IMC_GETCONVERSIONMODE, 0)
-        if not (current_mode & IME_CMODE_HANGUL):
-            new_mode = current_mode | IME_CMODE_HANGUL
-            user32.SendMessageW(hime_wnd, WM_IME_CONTROL, IMC_SETCONVERSIONMODE, new_mode)
-    except Exception as e:
-        pass
-        
-    # 크롬 등 SendMessage가 무시되는 앱을 위해, 상태 점검 후 안 바뀌었으면 물리적 한/영키 전송
-    time.sleep(0.02)
-    if not is_hangul_mode():
+    """실제 IME(Imm)가 영문이면 한글로 전환."""
+    if _real_hangul_now() is True:
+        return
+    hwnd = get_focused_hwnd()
+    if hwnd:
+        try:
+            hime_wnd = imm32.ImmGetDefaultIMEWnd(hwnd)
+            if hime_wnd:
+                current_mode = user32.SendMessageW(hime_wnd, WM_IME_CONTROL, IMC_GETCONVERSIONMODE, 0)
+                if not (current_mode & IME_CMODE_HANGUL):
+                    new_mode = current_mode | IME_CMODE_HANGUL
+                    user32.SendMessageW(hime_wnd, WM_IME_CONTROL, IMC_SETCONVERSIONMODE, new_mode)
+        except Exception:
+            pass
+    time.sleep(0.03)
+    _invalidate_ime_read_cache()
+    if _real_hangul_now() is False:
         si_tap(0x15)
+        time.sleep(0.03)
+    _invalidate_ime_read_cache()
 
 def get_mouse_overlay_pos():
     pt = POINT()
@@ -1089,11 +1189,28 @@ def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=Non
         time.sleep(0.04)
         si_hotkey(VK_CONTROL, VK_V)
         time.sleep(0.02)
-        
+
         if target_lang == "hangul":
             set_ime_to_hangul()
         else:
             set_ime_to_english()
+
+        time.sleep(0.05)
+        _invalidate_ime_read_cache()
+        real_after = _real_hangul_now()
+        if real_after is not None:
+            _apply_ime_instant_display(real_after)
+
+        imm_after = _read_ime_hangul_imm()
+        vk_after = _is_hangul_from_key_state()
+        _debug_log(
+            f"Post-convert ({trigger_source}): target={target_lang} "
+            f"imm={'한글' if imm_after else '영어' if imm_after is not None else '?'} "
+            f"vk={'한글' if vk_after else '영어'} "
+            f"win={get_active_window_title()!r}"
+        )
+        _clear_ime_display_cache()
+        update_tray_icon()
         
         global _restore_timer
         if _restore_timer:
@@ -1281,7 +1398,7 @@ class OverlayWidget:
         except Exception:
             pass
             
-        self.toplevel.after(10, self.update_loop)
+        self.toplevel.after(30, self.update_loop)
 
     def _apply_overlay_shape(self, state):
         self.canvas.itemconfig(self.circle, state="hidden")
@@ -1745,7 +1862,23 @@ def start_background():
     t = threading.Thread(target=timer_thread, daemon=True)
     t.start()
 
+def _acquire_single_instance():
+    ERROR_ALREADY_EXISTS = 183
+    handle = kernel32.CreateMutexW(None, True, "Local\\AutoEngApp.SingleInstance.v2.2.8")
+    if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        return False
+    return True
+
 def main():
+    if not _acquire_single_instance():
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showwarning(
+            "자동 영타 전환기",
+            "이미 실행 중입니다.\n작업 관리자에서 pythonw.exe(auto_eng_gui)를 종료한 뒤 다시 실행하세요.",
+        )
+        root.destroy()
+        return
     load_settings()
     start_background()
     root = tk.Tk()
