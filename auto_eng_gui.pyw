@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 import pyperclip
 import converter
 
-APP_VERSION = "2.2.8"
+APP_VERSION = "2.2.9"
 
 # --- Win32 API ---
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -43,6 +43,19 @@ user32.GetParent.restype = wintypes.HWND
 user32.GetParent.argtypes = [wintypes.HWND]
 
 user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
+HWND_TOPMOST = -1
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+OVERLAY_POS_POLL_MS = 16
+OVERLAY_IME_POLL_MS = 100
+OVERLAY_TOPMOST_REFRESH_SEC = 2.0
+OVERLAY_POS_MIN_DELTA = 2
 
 if sys.maxsize > 2**32:
     GetWindowLong = user32.GetWindowLongPtrW
@@ -143,7 +156,17 @@ def _phantom_key_hook(event):
 keyboard.hook(_phantom_key_hook)
 
 def _mouse_hook(event):
-    global _selection_active, _last_click_time, _mouse_down_pos, _phantom_buffer
+    global _selection_active, _last_click_time, _mouse_down_pos, _phantom_buffer, _overlay_pos_dirty
+    if isinstance(event, mouse.MoveEvent):
+        if app_state.get("overlay_enabled", False):
+            _overlay_pos_dirty = True
+            w = _overlay_widget_ref
+            if w is not None:
+                try:
+                    w.toplevel.after(0, w.refresh_position_now)
+                except Exception:
+                    pass
+        return
     if isinstance(event, mouse.ButtonEvent):
         if event.event_type == 'down' and event.button == 'middle':
             if (app_state.get("enabled") and app_state.get("typo_enabled", True)
@@ -195,6 +218,8 @@ def get_focused_hwnd():
     return hwnd
 
 _overlay_exclude_hwnds = set()
+_overlay_widget_ref = None
+_overlay_pos_dirty = False
 
 def _register_overlay_hwnd(hwnd):
     if hwnd:
@@ -357,7 +382,7 @@ _last_ime_fg_hwnd = None
 _ime_read_cache_at = 0.0
 _ime_read_cache_val = None
 IME_READ_CACHE_SEC = 0.05
-IME_OVERLAY_DEBOUNCE = 0.12
+IME_OVERLAY_DEBOUNCE = 0.06
 IME_INSTANT_HOLD = 0.5
 
 def _sync_ime_foreground():
@@ -377,6 +402,15 @@ def _apply_ime_instant_display(hangul):
     _ime_instant_until = time.time() + IME_INSTANT_HOLD
     _ime_instant_fg_hwnd = user32.GetForegroundWindow()
     update_tray_icon()
+    _notify_overlay_ime_refresh()
+
+def _notify_overlay_ime_refresh():
+    w = _overlay_widget_ref
+    if w is not None:
+        try:
+            w.toplevel.after(0, w.refresh_ime_now)
+        except Exception:
+            pass
 
 def _schedule_ime_display_refresh_after_haneng():
     """한/영 토글 후 실제 IME(Imm) 기준 표시 반영."""
@@ -390,6 +424,7 @@ def _schedule_ime_display_refresh_after_haneng():
             _invalidate_ime_read_cache()
             rh = _real_hangul_now()
             _apply_ime_instant_display(rh if rh is not None else _is_hangul_from_key_state())
+            _notify_overlay_ime_refresh()
             return
     threading.Thread(target=_work, daemon=True).start()
 
@@ -1211,6 +1246,7 @@ def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=Non
         )
         _clear_ime_display_cache()
         update_tray_icon()
+        _notify_overlay_ime_refresh()
         
         global _restore_timer
         if _restore_timer:
@@ -1309,13 +1345,14 @@ def apply_hotkeys():
 # --- Overlay Widget ---
 class OverlayWidget:
     def __init__(self, root):
+        global _overlay_widget_ref
         self.toplevel = tk.Toplevel(root)
         self.toplevel.overrideredirect(True)
         self.toplevel.attributes("-topmost", True)
-        
+
         TRANS_COLOR = "#000001"
         self.toplevel.config(bg=TRANS_COLOR)
-        
+
         self.canvas = tk.Canvas(self.toplevel, width=14, height=14, bg=TRANS_COLOR, highlightthickness=0)
         self.canvas.pack()
         self.circle = self.canvas.create_oval(1, 1, 13, 13, fill="#2196F3", outline=TRANS_COLOR)
@@ -1323,82 +1360,147 @@ class OverlayWidget:
         self.triangle = self.canvas.create_polygon(7, 1, 1, 13, 13, 13, fill="#9E9E9E", outline=TRANS_COLOR)
         self.canvas.itemconfig(self.square, state="hidden")
         self.canvas.itemconfig(self.triangle, state="hidden")
-        
+
         self.toplevel.update_idletasks()
-        
+
         self.toplevel.wm_attributes("-transparentcolor", TRANS_COLOR)
         self.toplevel.attributes("-alpha", 0.0)
-        
+
         hwnd = self.toplevel.winfo_id()
         parent_hwnd = user32.GetParent(hwnd)
-        target_hwnd = parent_hwnd if parent_hwnd else hwnd
-        
+        self._target_hwnd = parent_hwnd if parent_hwnd else hwnd
+
         GWL_EXSTYLE = -20
         WS_EX_LAYERED = 0x00080000
         WS_EX_TRANSPARENT = 0x00000020
         WS_EX_NOACTIVATE = 0x08000000
-        
-        ex_style = GetWindowLong(target_hwnd, GWL_EXSTYLE)
-        SetWindowLong(target_hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)
+
+        ex_style = GetWindowLong(self._target_hwnd, GWL_EXSTYLE)
+        SetWindowLong(self._target_hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)
         _register_overlay_hwnd(hwnd)
         _register_overlay_hwnd(parent_hwnd)
-        _register_overlay_hwnd(target_hwnd)
-        
+        _register_overlay_hwnd(self._target_hwnd)
+
+        try:
+            user32.SetWindowDisplayAffinity(self._target_hwnd, WDA_EXCLUDEFROMCAPTURE)
+        except Exception:
+            pass
+
         self._last_ime_state = None
         self._display_ime_state = None
         self._pending_ime_state = None
         self._pending_ime_since = 0.0
+        self._last_pos = None
+        self._last_topmost_at = 0.0
+        self._last_ime_tick = 0.0
+        self._visible = False
+        self._ime_refresh_now = False
+
+        _overlay_widget_ref = self
         self.update_loop()
-        
+
+    def refresh_ime_now(self):
+        self._ime_refresh_now = True
+
+    def refresh_position_now(self):
+        if running:
+            self._tick_position(time.time(), force=True)
+
+    def _should_show(self):
+        return (app_state.get("overlay_enabled", False)
+                and app_state.get("enabled", True)
+                and check_target_window())
+
+    def _set_visible(self, visible):
+        if self._visible != visible:
+            self._visible = visible
+            self.toplevel.attributes("-alpha", 0.8 if visible else 0.0)
+
+    def _tick_position(self, now, force=False):
+        global _overlay_pos_dirty
+        if not self._should_show():
+            self._set_visible(False)
+            self._last_pos = None
+            return
+
+        self._set_visible(True)
+        pos = get_mouse_overlay_pos()
+        if not pos:
+            return
+
+        x, y = pos
+        moved = (
+            force
+            or _overlay_pos_dirty
+            or self._last_pos is None
+            or abs(x - self._last_pos[0]) > OVERLAY_POS_MIN_DELTA
+            or abs(y - self._last_pos[1]) > OVERLAY_POS_MIN_DELTA
+        )
+        need_topmost = (now - self._last_topmost_at) >= OVERLAY_TOPMOST_REFRESH_SEC
+
+        if not moved and not need_topmost:
+            return
+
+        _overlay_pos_dirty = False
+
+        if moved:
+            if need_topmost or self._last_pos is None:
+                user32.SetWindowPos(
+                    self._target_hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE
+                )
+                self._last_topmost_at = now
+            else:
+                user32.SetWindowPos(
+                    self._target_hwnd, 0, x, y, 0, 0,
+                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                )
+            self._last_pos = (x, y)
+        elif need_topmost:
+            user32.SetWindowPos(
+                self._target_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE,
+            )
+            self._last_topmost_at = now
+
+    def _tick_ime(self, now):
+        if not self._should_show():
+            return
+
+        ime_state = get_ime_display_state(check_active=False)
+        if ime_state != self._display_ime_state:
+            if self._pending_ime_state != ime_state:
+                self._pending_ime_state = ime_state
+                self._pending_ime_since = now
+            elif (now - self._pending_ime_since) >= _ime_overlay_debounce_sec():
+                self._display_ime_state = ime_state
+                if ime_state != self._last_ime_state:
+                    self._last_ime_state = ime_state
+                    labels = {"hangul": "한글", "english": "영어", "unknown": "불명"}
+                    _debug_log(
+                        f"Overlay: {labels.get(ime_state, ime_state)} "
+                        f"win={get_active_window_title()!r}"
+                    )
+        else:
+            self._pending_ime_state = None
+
+        shape = self._display_ime_state if self._display_ime_state is not None else ime_state
+        self._apply_overlay_shape(shape)
+
     def update_loop(self):
         if not running:
             return
-            
+
         try:
-            if app_state.get("overlay_enabled", False) and app_state["enabled"] and check_target_window():
-                hwnd_inner = self.toplevel.winfo_id()
-                parent_hwnd = user32.GetParent(hwnd_inner)
-                target_hwnd = parent_hwnd if parent_hwnd else hwnd_inner
-
-                pos = get_mouse_overlay_pos()
-                if pos:
-                    x, y = pos
-                    
-                    HWND_TOPMOST = -1
-                    SWP_NOSIZE = 0x0001
-                    SWP_NOACTIVATE = 0x0010
-                    # 항상 최상단을 유지하도록 HWND_TOPMOST 강제 지정 (SWP_NOZORDER 제거)
-                    user32.SetWindowPos(target_hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE)
-                    
-                    # 반투명도 설정 (조금 덜 투명하게 80%)
-                    self.toplevel.attributes("-alpha", 0.8)
-                    
-                    ime_state = get_ime_display_state(check_active=False)
-                    now = time.time()
-                    if ime_state != self._display_ime_state:
-                        if self._pending_ime_state != ime_state:
-                            self._pending_ime_state = ime_state
-                            self._pending_ime_since = now
-                        elif (now - self._pending_ime_since) >= _ime_overlay_debounce_sec():
-                            self._display_ime_state = ime_state
-                            if ime_state != self._last_ime_state:
-                                self._last_ime_state = ime_state
-                                labels = {"hangul": "한글", "english": "영어", "unknown": "불명"}
-                                _debug_log(
-                                    f"Overlay: {labels.get(ime_state, ime_state)} "
-                                    f"win={get_active_window_title()!r}"
-                                )
-                    else:
-                        self._pending_ime_state = None
-
-                    shape = self._display_ime_state if self._display_ime_state is not None else ime_state
-                    self._apply_overlay_shape(shape)
-            else:
-                self.toplevel.attributes("-alpha", 0.0)
+            now = time.time()
+            self._tick_position(now)
+            if self._ime_refresh_now or (now - self._last_ime_tick) * 1000 >= OVERLAY_IME_POLL_MS:
+                self._ime_refresh_now = False
+                self._last_ime_tick = now
+                self._tick_ime(now)
         except Exception:
             pass
-            
-        self.toplevel.after(30, self.update_loop)
+
+        self.toplevel.after(OVERLAY_POS_POLL_MS, self.update_loop)
 
     def _apply_overlay_shape(self, state):
         self.canvas.itemconfig(self.circle, state="hidden")
@@ -1586,7 +1688,8 @@ class AutoEngApp:
         frame_overlay.pack(fill='x', pady=5, padx=15)
         self.var_overlay_enabled = tk.BooleanVar(value=app_state.get("overlay_enabled", False))
         ttk.Checkbutton(frame_overlay, text="커서(마우스) 주변에 한/영 상태 아이콘 띄우기", variable=self.var_overlay_enabled, command=self.update_settings).pack(anchor='w', pady=5, padx=10)
-        ttk.Label(frame_overlay, text="한글: 파란 원 / 영어: 빨간 사각형 / 비활성·불명: 회색 삼각형", foreground="gray").pack(anchor='w', padx=25, pady=(0, 10))
+        ttk.Label(frame_overlay, text="한글: 파란 원 / 영어: 빨간 사각형 / 비활성·불명: 회색 삼각형", foreground="gray").pack(anchor='w', padx=25, pady=(0, 2))
+        ttk.Label(frame_overlay, text="스크린샷·화면 공유에는 아이콘이 나오지 않습니다 (Windows 10 2004+).", foreground="gray").pack(anchor='w', padx=25, pady=(0, 10))
 
         frame_target = ttk.LabelFrame(content, text="대상 프로그램 설정 (창 제목 기준)")
         frame_target.pack(fill='x', pady=5, padx=15)
@@ -1864,7 +1967,7 @@ def start_background():
 
 def _acquire_single_instance():
     ERROR_ALREADY_EXISTS = 183
-    handle = kernel32.CreateMutexW(None, True, "Local\\AutoEngApp.SingleInstance.v2.2.8")
+    handle = kernel32.CreateMutexW(None, True, "Local\\AutoEngApp.SingleInstance.v2.2.9")
     if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
         return False
     return True
