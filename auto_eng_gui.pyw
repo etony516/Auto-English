@@ -14,12 +14,90 @@ from PIL import Image, ImageDraw
 import pyperclip
 import converter
 
-APP_VERSION = "2.2.9"
+APP_VERSION = "2.3.2"
 
 # --- Win32 API ---
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 imm32 = ctypes.WinDLL('imm32', use_last_error=True)
 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+advapi32 = ctypes.WinDLL('advapi32', use_last_error=True)
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+TOKEN_QUERY = 0x0008
+TokenElevation = 20
+WM_GETTEXT = 0x000D
+WM_GETTEXTLENGTH = 0x000E
+EM_GETSEL = 0x00B0
+EM_SETSEL = 0x00B1
+EM_REPLACESEL = 0x00C2
+
+class TOKEN_ELEVATION(ctypes.Structure):
+    _fields_ = [("TokenIsElevated", wintypes.DWORD)]
+
+_self_elevated = None
+_last_uipi_warn_at = 0.0
+
+def _process_is_elevated(pid):
+    if not pid:
+        return False
+    hproc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not hproc:
+        return False
+    token = wintypes.HANDLE()
+    elevated = False
+    try:
+        if advapi32.OpenProcessToken(hproc, TOKEN_QUERY, ctypes.byref(token)):
+            te = TOKEN_ELEVATION()
+            ret_len = wintypes.DWORD()
+            if advapi32.GetTokenInformation(
+                token, TokenElevation, ctypes.byref(te),
+                ctypes.sizeof(te), ctypes.byref(ret_len),
+            ):
+                elevated = bool(te.TokenIsElevated)
+    finally:
+        if token.value:
+            kernel32.CloseHandle(token)
+        kernel32.CloseHandle(hproc)
+    return elevated
+
+def _self_is_elevated():
+    global _self_elevated
+    if _self_elevated is None:
+        _self_elevated = _process_is_elevated(os.getpid())
+    return _self_elevated
+
+def _foreground_uipi_blocked():
+    """일반 권한 앱 → 관리자 권한 창: Windows가 입력·SendMessage를 차단."""
+    if _self_is_elevated():
+        return False
+    fg = user32.GetForegroundWindow()
+    if not fg:
+        return False
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+    return _process_is_elevated(pid.value)
+
+def _warn_uipi_blocked_once():
+    global _last_uipi_warn_at
+    now = time.time()
+    if now - _last_uipi_warn_at < 30.0:
+        return
+    _last_uipi_warn_at = now
+    title = get_active_window_title()
+    _debug_log(f"UIPI blocked: fg={title!r} is admin, auto_eng is not")
+    def _show():
+        messagebox.showwarning(
+            "자동 영타 전환기",
+            f"「{title}」이(가) 관리자 권한으로 실행 중입니다.\n\n"
+            "이 상태에서는 더블 Shift·입력 변환이 Windows 보안 정책상 작동하지 않습니다.\n\n"
+            "해결 방법 (택1):\n"
+            "1) 폴더의 「자동영타_관리자실행.bat」 실행\n"
+            "2) MySQL Workbench를 일반 권한으로 실행 (호환성 → 관리자 권한 해제)",
+        )
+    try:
+        tk._default_root.after(0, _show) if tk._default_root else _show()
+    except Exception:
+        pass
 
 imm32.ImmGetContext.argtypes = [wintypes.HWND]
 imm32.ImmGetContext.restype = wintypes.HANDLE
@@ -41,6 +119,10 @@ kernel32.GetLastError.restype = wintypes.DWORD
 
 user32.GetParent.restype = wintypes.HWND
 user32.GetParent.argtypes = [wintypes.HWND]
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
+user32.EnumChildWindows.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.LPARAM]
+user32.EnumChildWindows.restype = wintypes.BOOL
 
 user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
 user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
@@ -221,6 +303,115 @@ _overlay_exclude_hwnds = set()
 _overlay_widget_ref = None
 _overlay_pos_dirty = False
 
+def _hwnd_class_name(hwnd):
+    if not hwnd:
+        return ""
+    buff = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buff, 256)
+    return buff.value
+
+def _is_scintilla_hwnd(hwnd):
+    return "scintilla" in _hwnd_class_name(hwnd).lower()
+
+def _scintilla_focus_hwnd():
+    fg = user32.GetForegroundWindow()
+    if fg:
+        gui_info = GUITHREADINFO()
+        gui_info.cbSize = ctypes.sizeof(GUITHREADINFO)
+        thread_id = user32.GetWindowThreadProcessId(fg, None)
+        if user32.GetGUIThreadInfo(thread_id, ctypes.byref(gui_info)):
+            for hwnd in (gui_info.hwndFocus, gui_info.hwndCaret):
+                if hwnd and _is_scintilla_hwnd(hwnd):
+                    return hwnd
+    for hwnd in (_hwnd_at_cursor(), get_focused_hwnd()):
+        if hwnd and _is_scintilla_hwnd(hwnd):
+            return hwnd
+    if fg:
+        found = []
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _enum_child(hwnd, _):
+            if _is_scintilla_hwnd(hwnd):
+                found.append(hwnd)
+                return False
+            return True
+        user32.EnumChildWindows(fg, _enum_child, 0)
+        if found:
+            return found[0]
+    return None
+
+# WinForms Scintilla 편집기 (MySQL Workbench 등) — WM_GETTEXT/EM_* 경로
+
+def _winforms_editor_prefix(hwnd):
+    start = wintypes.DWORD()
+    end = wintypes.DWORD()
+    user32.SendMessageW(hwnd, EM_GETSEL, ctypes.byref(start), ctypes.byref(end))
+    length = user32.SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0)
+    if length <= 0:
+        return "", start.value
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.SendMessageW(hwnd, WM_GETTEXT, length + 1, buf)
+    return buf.value[:start.value], start.value
+
+def _winforms_editor_replace_prefix(hwnd, caret_pos, new_prefix):
+    user32.SendMessageW(hwnd, EM_SETSEL, 0, caret_pos)
+    buf = ctypes.create_unicode_buffer(new_prefix)
+    user32.SendMessageW(hwnd, EM_REPLACESEL, 1, ctypes.cast(buf, wintypes.LPWSTR))
+
+def _scintilla_convert_at_caret(hwnd):
+    """WinForms Scintilla 편집기에서 선택/마지막 단어 변환. (성공, target_lang) 또는 (False, None)."""
+    if _foreground_uipi_blocked():
+        _warn_uipi_blocked_once()
+        return False, None
+
+    import re
+    prefix, caret = _winforms_editor_prefix(hwnd)
+    sel_start = wintypes.DWORD()
+    sel_end = wintypes.DWORD()
+    user32.SendMessageW(hwnd, EM_GETSEL, ctypes.byref(sel_start), ctypes.byref(sel_end))
+    target_lang = None
+
+    if sel_start.value != sel_end.value:
+        length = user32.SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0)
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.SendMessageW(hwnd, WM_GETTEXT, length + 1, buf)
+        target_text = buf.value[sel_start.value:sel_end.value]
+        if not target_text or target_text.isspace():
+            return False, None
+        converted, target_lang = converter.auto_convert(target_text)
+        user32.SendMessageW(hwnd, EM_SETSEL, sel_start.value, sel_end.value)
+        nb = ctypes.create_unicode_buffer(converted)
+        user32.SendMessageW(hwnd, EM_REPLACESEL, 1, ctypes.cast(nb, wintypes.LPWSTR))
+        _debug_log(f"WinForms selection convert: {repr(target_text)} -> {repr(converted)}")
+        return True, target_lang
+
+    if not prefix or prefix.isspace():
+        with _phantom_lock:
+            buf = _phantom_buffer.strip()
+        if buf:
+            prefix = buf
+            caret = len(buf)
+            _debug_log("WinForms: using phantom buffer for line prefix")
+        else:
+            return False, None
+
+    m = re.search(r"(\w+)([^\w]*)$", prefix)
+    if not m:
+        converted, target_lang = converter.auto_convert(prefix)
+        new_text = converted
+    else:
+        target_text = m.group(1)
+        converted, target_lang = converter.auto_convert(target_text)
+        with _phantom_lock:
+            buf = _phantom_buffer.lower()
+            idx = buf.rfind(converted.lower())
+            if idx != -1 and idx >= len(buf) - len(converted) - 10:
+                converted = _phantom_buffer[idx:idx + len(converted)]
+        new_text = prefix[:m.start(1)] + converted + m.group(2)
+
+    _winforms_editor_replace_prefix(hwnd, caret, new_text)
+    _debug_log(f"WinForms word convert: {repr(prefix)} -> {repr(new_text)}")
+    return True, target_lang
+
 def _register_overlay_hwnd(hwnd):
     if hwnd:
         _overlay_exclude_hwnds.add(hwnd)
@@ -287,6 +478,9 @@ def _ime_hwnd_candidates_weighted():
             add(gui_info.hwndCaret, 5)
             add(gui_info.hwndFocus, 4)
     add(_hwnd_at_cursor(), 6)
+    sci = _scintilla_focus_hwnd()
+    if sci:
+        add(sci, 9)
     if fg and not chromium:
         add(fg, 1)
     if not chromium:
@@ -305,6 +499,9 @@ def _chrome_ime_hwnds_ordered():
             hwnds.append(hwnd)
 
     fg = user32.GetForegroundWindow()
+    sci = _scintilla_focus_hwnd()
+    if sci:
+        add(sci)
     if fg:
         gui_info = GUITHREADINFO()
         gui_info.cbSize = ctypes.sizeof(GUITHREADINFO)
@@ -680,7 +877,7 @@ def on_key_event(e):
             if mod_base in _pressed_mods:
                 return
             _pressed_mods.add(mod_base)
-            if app_state["enabled"]:
+            if app_state["enabled"] and app_state.get("trigger_mode") != "modifier":
                 _handle_modifier_tap(e.name)
 
         if time.time() - last_key_time > 2.0:
@@ -839,6 +1036,13 @@ VK_BACK = 0x08
 VK_TAB = 0x09
 VK_ENTER = 0x0D
 VK_SHIFT = 0x10
+VK_LSHIFT = 0xA0
+VK_RSHIFT = 0xA1
+VK_LCONTROL = 0xA2
+VK_RCONTROL = 0xA3
+VK_LMENU = 0xA4
+VK_RMENU = 0xA5
+VK_LEFT = 0x25
 VK_CONTROL = 0x11
 VK_MENU = 0x12
 VK_SPACE = 0x20
@@ -934,8 +1138,11 @@ def safe_copy(text):
 # --- WH_KEYBOARD_LL (희귀키 연타 트리거, 키 suppress) ---
 WH_KEYBOARD_LL = 13
 WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
 WM_SYSKEYDOWN = 0x0104
+WM_SYSKEYUP = 0x0105
 LLKHF_INJECTED = 0x10
+LLKHF_REPEAT = 0x4000
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [
@@ -957,6 +1164,21 @@ _streak_count = 0
 _streak_last_time = 0.0
 _streak_captured_clip = None
 _streak_had_selection = False
+
+_mod_streak_count = 0
+_mod_streak_last_time = 0.0
+
+MODIFIER_LL_VK = {
+    "shift": (VK_LSHIFT, VK_RSHIFT),
+    "left shift": (VK_LSHIFT,),
+    "right shift": (VK_RSHIFT,),
+    "ctrl": (VK_LCONTROL, VK_RCONTROL),
+    "left ctrl": (VK_LCONTROL,),
+    "right ctrl": (VK_RCONTROL,),
+    "alt": (VK_LMENU, VK_RMENU),
+    "left alt": (VK_LMENU,),
+    "right alt": (VK_RMENU,),
+}
 
 user32.SetWindowsHookExW.argtypes = [ctypes.c_int, LowLevelKeyboardProc, wintypes.HINSTANCE, wintypes.DWORD]
 user32.SetWindowsHookExW.restype = wintypes.HHOOK
@@ -985,12 +1207,52 @@ def _reset_streak():
     _streak_captured_clip = None
     _streak_had_selection = False
 
+def _reset_mod_streak():
+    global _mod_streak_count, _mod_streak_last_time
+    _mod_streak_count = 0
+    _mod_streak_last_time = 0.0
+
+def _vk_resets_modifier_streak(vk_code):
+    return vk_code not in _get_all_modifier_vks()
+
+def _all_modifier_vks():
+    vks = set()
+    for group in MODIFIER_LL_VK.values():
+        vks.update(group)
+    return vks
+
+_ALL_MODIFIER_VKS = None
+
+def _get_all_modifier_vks():
+    global _ALL_MODIFIER_VKS
+    if _ALL_MODIFIER_VKS is None:
+        _ALL_MODIFIER_VKS = _all_modifier_vks()
+    return _ALL_MODIFIER_VKS
+
+def _ll_modifier_vk_matches(vk_code):
+    trigger = app_state.get("trigger_mod_key", "shift").lower()
+    return vk_code in MODIFIER_LL_VK.get(trigger, MODIFIER_LL_VK["shift"])
+
+def _handle_ll_modifier_streak():
+    global _mod_streak_count, _mod_streak_last_time
+    now = time.time()
+    timeout = app_state.get("trigger_mod_timeout", 600) / 1000.0
+    target = max(1, int(app_state.get("trigger_mod_count", 2)))
+    if _mod_streak_count > 0 and (now - _mod_streak_last_time) > timeout:
+        _mod_streak_count = 0
+    _mod_streak_count += 1
+    _mod_streak_last_time = now
+    _debug_log(f"LL Modifier tap {_mod_streak_count}/{target}")
+    if _mod_streak_count >= target:
+        _reset_mod_streak()
+        if _foreground_uipi_blocked():
+            _debug_log("Modifier trigger ignored: admin foreground (UIPI)")
+            return
+        _request_typo_convert("modifier")
+
 def _ll_keyboard_proc(nCode, wParam, lParam):
     global _streak_count, _streak_last_time, _streak_captured_clip, _streak_had_selection
     if nCode < 0:
-        return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
-
-    if wParam not in (WM_KEYDOWN, WM_SYSKEYDOWN):
         return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
 
     kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
@@ -1001,7 +1263,27 @@ def _ll_keyboard_proc(nCode, wParam, lParam):
         return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
 
     mode = app_state.get("trigger_mode")
-    if mode != "rare":
+
+    if mode == "modifier":
+        if not app_state.get("enabled") or not app_state.get("typo_enabled", True):
+            return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
+        if not check_target_window():
+            return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
+
+        is_down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+        if not is_down:
+            return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
+
+        if kb.flags & LLKHF_REPEAT:
+            return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
+
+        if _ll_modifier_vk_matches(kb.vkCode):
+            _handle_ll_modifier_streak()
+        elif _vk_resets_modifier_streak(kb.vkCode):
+            _reset_mod_streak()
+        return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
+
+    if wParam not in (WM_KEYDOWN, WM_SYSKEYDOWN):
         return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
 
     if not app_state.get("enabled") or not app_state.get("typo_enabled", True):
@@ -1053,12 +1335,13 @@ def stop_ll_hook():
         _ll_hook_thread = None
         time.sleep(0.05)
     _reset_streak()
+    _reset_mod_streak()
 
 def apply_ll_hook():
     global _ll_hook_thread, _ll_hook_thread_id
     stop_ll_hook()
     mode = app_state.get("trigger_mode")
-    if app_state.get("typo_enabled", True) and mode == "rare":
+    if app_state.get("typo_enabled", True) and mode in ("rare", "modifier"):
         try:
             t = threading.Thread(target=_ll_hook_thread_fn, daemon=True)
             t.start()
@@ -1088,7 +1371,7 @@ def _request_typo_convert(source, pre_captured_text=None, pre_job=None):
     ).start()
 
 def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=None):
-    global _typo_running, _phantom_buffer
+    global _typo_running, _phantom_buffer, _selection_active, _restore_timer
     global mod_key_count, last_mod_key, _last_typo_finish_time
     if _typo_running:
         return
@@ -1101,6 +1384,11 @@ def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=Non
 
     try:
         _debug_log(f"--- Typo Triggered ({trigger_source}) ---")
+        if _foreground_uipi_blocked():
+            _debug_log("Aborted: UIPI blocked (admin foreground)")
+            if trigger_source != "modifier":
+                _warn_uipi_blocked_once()
+            return
         if not app_state.get("typo_enabled", True):
             _debug_log("Aborted: disabled")
             return
@@ -1128,6 +1416,47 @@ def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=Non
         time.sleep(0.01)
         release_all_modifiers()
         _debug_log("Modifiers released, starting macro")
+
+        def _finish_convert(target_lang, orig_clip=None):
+            if target_lang == "hangul":
+                set_ime_to_hangul()
+            else:
+                set_ime_to_english()
+            time.sleep(0.05)
+            _invalidate_ime_read_cache()
+            real_after = _real_hangul_now()
+            if real_after is not None:
+                _apply_ime_instant_display(real_after)
+            imm_after = _read_ime_hangul_imm()
+            vk_after = _is_hangul_from_key_state()
+            _debug_log(
+                f"Post-convert ({trigger_source}): target={target_lang} "
+                f"imm={'한글' if imm_after else '영어' if imm_after is not None else '?'} "
+                f"vk={'한글' if vk_after else '영어'} "
+                f"win={get_active_window_title()!r}"
+            )
+            _clear_ime_display_cache()
+            update_tray_icon()
+            _notify_overlay_ime_refresh()
+            if orig_clip is not None:
+                global _restore_timer
+                if _restore_timer:
+                    _restore_timer.cancel()
+                def restore_clip():
+                    safe_copy(orig_clip)
+                _restore_timer = threading.Timer(1.5, restore_clip)
+                _restore_timer.start()
+
+        sci = _scintilla_focus_hwnd()
+        if sci and pre_captured_text is None:
+            ok, sci_lang = _scintilla_convert_at_caret(sci)
+            if ok and sci_lang:
+                with _phantom_lock:
+                    _phantom_buffer = ""
+                _selection_active = False
+                _finish_convert(sci_lang)
+                return
+            _debug_log("Scintilla direct path failed, falling back to clipboard")
 
         orig_clip = safe_paste()
 
@@ -1169,8 +1498,11 @@ def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=Non
                 
             else:
                 # 선택 없음: 커서 앞부분(clip2)에서 마지막 단어만 변환
-                # Step 2: 현재 줄 텍스트 전체(커서 앞부분) 복사
-                si_hotkey(VK_SHIFT, VK_HOME)
+                if _scintilla_focus_hwnd():
+                    _debug_log("Scintilla editor: Ctrl+Shift+Left word select")
+                    si_hotkey(VK_CONTROL, VK_SHIFT, VK_LEFT)
+                else:
+                    si_hotkey(VK_SHIFT, VK_HOME)
                 time.sleep(0.02)
                 
                 seq_before = user32.GetClipboardSequenceNumber()
@@ -1186,9 +1518,15 @@ def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=Non
                     time.sleep(0.002)
                 
                 if not clip2 or clip2.isspace():
-                    _debug_log("No text found on line, aborting safely")
-                    safe_copy(orig_clip)
-                    return
+                    with _phantom_lock:
+                        buf = _phantom_buffer.strip()
+                    if buf:
+                        _debug_log("Using phantom buffer fallback")
+                        clip2 = buf
+                    else:
+                        _debug_log("No text found on line, aborting safely")
+                        safe_copy(orig_clip)
+                        return
 
                 _debug_log("Extracting last word from line")
                 import re
@@ -1205,7 +1543,6 @@ def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=Non
                     converted, target_lang = converter.auto_convert(target_text)
                     
                     # 팬텀 버퍼를 이용한 대소문자 복원
-                    global _phantom_buffer
                     with _phantom_lock:
                         buf = _phantom_buffer.lower()
                         idx = buf.rfind(converted.lower())
@@ -1225,45 +1562,14 @@ def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=Non
         si_hotkey(VK_CONTROL, VK_V)
         time.sleep(0.02)
 
-        if target_lang == "hangul":
-            set_ime_to_hangul()
-        else:
-            set_ime_to_english()
-
-        time.sleep(0.05)
-        _invalidate_ime_read_cache()
-        real_after = _real_hangul_now()
-        if real_after is not None:
-            _apply_ime_instant_display(real_after)
-
-        imm_after = _read_ime_hangul_imm()
-        vk_after = _is_hangul_from_key_state()
-        _debug_log(
-            f"Post-convert ({trigger_source}): target={target_lang} "
-            f"imm={'한글' if imm_after else '영어' if imm_after is not None else '?'} "
-            f"vk={'한글' if vk_after else '영어'} "
-            f"win={get_active_window_title()!r}"
-        )
-        _clear_ime_display_cache()
-        update_tray_icon()
-        _notify_overlay_ime_refresh()
-        
-        global _restore_timer
-        if _restore_timer:
-            _restore_timer.cancel()
-            
-        def restore_clip():
-            safe_copy(orig_clip)
-            
-        # 에디터가 Ctrl+V를 처리하기 전에 클립보드가 원상복구되는 Race Condition 방지 (1.5s)
-        _restore_timer = threading.Timer(1.5, restore_clip)
-        _restore_timer.start()
+        _finish_convert(target_lang, orig_clip)
         
     except Exception as e:
         _debug_log(f"Exception: {e}")
     finally:
         _pressed_mods.clear()
         _reset_streak()
+        _reset_mod_streak()
         _last_typo_finish_time = time.time()
         _typo_running = False
 
@@ -1967,7 +2273,7 @@ def start_background():
 
 def _acquire_single_instance():
     ERROR_ALREADY_EXISTS = 183
-    handle = kernel32.CreateMutexW(None, True, "Local\\AutoEngApp.SingleInstance.v2.2.9")
+    handle = kernel32.CreateMutexW(None, True, "Local\\AutoEngApp.SingleInstance")
     if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
         return False
     return True
@@ -1982,6 +2288,7 @@ def main():
         )
         root.destroy()
         return
+    _debug_log(f"AutoEng v{APP_VERSION} started (elevated={_self_is_elevated()})")
     load_settings()
     start_background()
     root = tk.Tk()
