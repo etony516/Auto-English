@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 import pyperclip
 import converter
 
-APP_VERSION = "2.3.3"
+APP_VERSION = "2.3.4"
 
 # --- Win32 API ---
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -1264,6 +1264,16 @@ def _ll_keyboard_proc(nCode, wParam, lParam):
     if kb.flags & LLKHF_INJECTED:
         return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
 
+    # 변환 실행 중: 사용자 키 잠금 (단축키 꼬임 방지)
+    if _typo_phase == "executing":
+        return 1
+
+    # 변환 준비 중: 새 키를 누르면 취소 가능 (키는 앱으로 통과)
+    if _typo_phase == "preparing":
+        if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN) and not (kb.flags & LLKHF_REPEAT):
+            _request_typo_cancel(f"user key during prepare vk=0x{kb.vkCode:02X}")
+        return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
+
     if _typo_running:
         return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
 
@@ -1355,8 +1365,8 @@ def stop_ll_hook():
 def apply_ll_hook():
     global _ll_hook_thread, _ll_hook_thread_id
     stop_ll_hook()
-    mode = app_state.get("trigger_mode")
-    if app_state.get("typo_enabled", True) and mode in ("rare", "modifier"):
+    # 변환 준비(취소)·실행(잠금)에도 훅이 필요하므로 typo 켜져 있으면 항상 기동
+    if app_state.get("typo_enabled", True):
         try:
             t = threading.Thread(target=_ll_hook_thread_fn, daemon=True)
             t.start()
@@ -1366,8 +1376,68 @@ def apply_ll_hook():
             _debug_log(f"LL hook start failed: {e}")
 
 _typo_running = False
+_typo_phase = None  # None | "preparing" | "executing"
+_typo_cancel = False
 _last_typo_finish_time = 0.0
 TYPO_TRIGGER_COOLDOWN = 0.8
+TYPO_KEY_RELEASE_TIMEOUT = 1.5
+
+# 변환 시작 직전 "눌린 채" 감지용 (문자·숫자·기능·방향·OEM 등)
+_HELD_KEY_VKS = (
+    list(range(0x08, 0x0E))  # Backspace~Enter
+    + [0x10, 0x11, 0x12, 0x14, 0x1B, 0x20]  # Shift/Ctrl/Alt/Caps/Esc/Space
+    + list(range(0x21, 0x29))  # PageUp~Down arrow
+    + list(range(0x30, 0x3A))  # 0-9
+    + list(range(0x41, 0x5B))  # A-Z
+    + list(range(0x5B, 0x5F))  # Win/App
+    + list(range(0x60, 0x70))  # Numpad
+    + list(range(0x70, 0x88))  # F1-F24
+    + list(range(0xA0, 0xA6))  # L/R Shift/Ctrl/Alt
+    + list(range(0xBA, 0xC1))  # OEM ;=,-./`
+    + list(range(0xDB, 0xE0))  # OEM [\]'
+)
+
+def _set_typo_phase(phase):
+    global _typo_phase, _typo_cancel
+    _typo_phase = phase
+    if phase == "preparing":
+        _typo_cancel = False
+    elif phase is None:
+        _typo_cancel = False
+
+def _request_typo_cancel(reason):
+    global _typo_cancel
+    if _typo_phase == "preparing" and not _typo_cancel:
+        _typo_cancel = True
+        _debug_log(f"Typo cancel requested: {reason}")
+
+def _is_typo_cancelled():
+    return _typo_cancel
+
+def _vk_is_down(vk):
+    return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+def _any_held_keys():
+    for vk in _HELD_KEY_VKS:
+        if _vk_is_down(vk):
+            return True
+    return False
+
+def _wait_all_keys_released(timeout=TYPO_KEY_RELEASE_TIMEOUT):
+    """눌린 키가 모두 떨어질 때까지 대기. 그사이 새 키 → 취소."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if _is_typo_cancelled():
+            return False
+        if not _any_held_keys():
+            return True
+        time.sleep(0.01)
+    if _is_typo_cancelled():
+        return False
+    if _any_held_keys():
+        _debug_log("Key release wait timed out")
+        return False
+    return True
 
 def _request_typo_convert(source, pre_captured_text=None, pre_job=None):
     if _typo_running:
@@ -1394,6 +1464,7 @@ def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=Non
         _debug_log(f"Typo aborted ({trigger_source}): cooldown")
         return
     _typo_running = True
+    _set_typo_phase("preparing")
     mod_key_count = 0
     last_mod_key = None
 
@@ -1411,11 +1482,14 @@ def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=Non
         if pre_job:
             pre_job()
             
-        # 트리거 키가 모두 떼질 때까지 대기
+        # 트리거 키가 모두 떼질 때까지 대기 (준비 단계: 새 키 입력 시 취소)
         keys_to_wait = _keys_to_release_before_macro(trigger_source)
 
         timeout = time.time() + 3.0
         while time.time() < timeout:
+            if _is_typo_cancelled():
+                _debug_log("Cancelled during trigger-key wait")
+                return
             any_pressed = False
             for k in keys_to_wait:
                 try:
@@ -1428,9 +1502,24 @@ def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=Non
                 break
             time.sleep(0.01)
 
+        if _is_typo_cancelled():
+            _debug_log("Cancelled after trigger-key wait")
+            return
+
+        # 그 외 눌린 글자/기능키도 떨어질 때까지 대기
+        if not _wait_all_keys_released():
+            _debug_log("Cancelled while waiting for held keys")
+            return
+
         time.sleep(0.01)
+        if _is_typo_cancelled():
+            _debug_log("Cancelled just before macro")
+            return
+
         release_all_modifiers()
-        _debug_log("Modifiers released, starting macro")
+        # 실행 단계: 사용자 키 잠금 후 매크로
+        _set_typo_phase("executing")
+        _debug_log("Input locked, starting macro")
 
         def _finish_convert(target_lang, orig_clip=None):
             if target_lang == "hangul":
@@ -1582,6 +1671,7 @@ def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=Non
     except Exception as e:
         _debug_log(f"Exception: {e}")
     finally:
+        _set_typo_phase(None)
         _pressed_mods.clear()
         _reset_streak()
         _reset_mod_streak()
