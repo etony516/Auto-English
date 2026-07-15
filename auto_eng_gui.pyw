@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 import pyperclip
 import converter
 
-APP_VERSION = "2.3.2"
+APP_VERSION = "2.3.3"
 
 # --- Win32 API ---
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -1167,6 +1167,8 @@ _streak_had_selection = False
 
 _mod_streak_count = 0
 _mod_streak_last_time = 0.0
+_mod_ll_armed = False
+_mod_ll_armed_vk = 0
 
 MODIFIER_LL_VK = {
     "shift": (VK_LSHIFT, VK_RSHIFT),
@@ -1208,9 +1210,11 @@ def _reset_streak():
     _streak_had_selection = False
 
 def _reset_mod_streak():
-    global _mod_streak_count, _mod_streak_last_time
+    global _mod_streak_count, _mod_streak_last_time, _mod_ll_armed, _mod_ll_armed_vk
     _mod_streak_count = 0
     _mod_streak_last_time = 0.0
+    _mod_ll_armed = False
+    _mod_ll_armed_vk = 0
 
 def _vk_resets_modifier_streak(vk_code):
     return vk_code not in _get_all_modifier_vks()
@@ -1252,6 +1256,7 @@ def _handle_ll_modifier_streak():
 
 def _ll_keyboard_proc(nCode, wParam, lParam):
     global _streak_count, _streak_last_time, _streak_captured_clip, _streak_had_selection
+    global _mod_ll_armed, _mod_ll_armed_vk
     if nCode < 0:
         return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
 
@@ -1271,16 +1276,26 @@ def _ll_keyboard_proc(nCode, wParam, lParam):
             return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
 
         is_down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
-        if not is_down:
+        is_up = wParam in (WM_KEYUP, WM_SYSKEYUP)
+        if not is_down and not is_up:
             return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
 
-        if kb.flags & LLKHF_REPEAT:
+        if is_down:
+            if kb.flags & LLKHF_REPEAT:
+                return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
+            if _ll_modifier_vk_matches(kb.vkCode):
+                _mod_ll_armed = True
+                _mod_ll_armed_vk = kb.vkCode
+            elif _vk_resets_modifier_streak(kb.vkCode):
+                _mod_ll_armed = False
+                _mod_ll_armed_vk = 0
+                _reset_mod_streak()
             return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
 
-        if _ll_modifier_vk_matches(kb.vkCode):
+        if _ll_modifier_vk_matches(kb.vkCode) and _mod_ll_armed:
+            _mod_ll_armed = False
+            _mod_ll_armed_vk = 0
             _handle_ll_modifier_streak()
-        elif _vk_resets_modifier_streak(kb.vkCode):
-            _reset_mod_streak()
         return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
 
     if wParam not in (WM_KEYDOWN, WM_SYSKEYDOWN):
