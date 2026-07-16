@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 import pyperclip
 import converter
 
-APP_VERSION = "2.3.4"
+APP_VERSION = "2.3.5"
 
 # --- Win32 API ---
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -1106,15 +1106,14 @@ def si_hotkey(*vks, delay=0.02):
         si_release(vk)
 
 def release_all_modifiers():
-    si_release(VK_SHIFT)
-    si_release(VK_CONTROL)
-    # VK_MENU(Alt)는 제외: Alt UP 이벤트는 Windows의 메뉴 활성화를 해서 방해됨
-    
+    for vk in (VK_SHIFT, VK_CONTROL, VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU):
+        si_release(vk)
     # OS 레벨에서 논리적/물리적 키 상태가 완전히 해제될 때까지 폴링 (동기화)
     end_time = time.time() + 0.5
     while time.time() < end_time:
         if not (user32.GetAsyncKeyState(VK_SHIFT) & 0x8000) and \
-           not (user32.GetAsyncKeyState(VK_CONTROL) & 0x8000):
+           not (user32.GetAsyncKeyState(VK_CONTROL) & 0x8000) and \
+           not (user32.GetAsyncKeyState(VK_MENU) & 0x8000):
             break
         time.sleep(0.001)
 
@@ -1219,6 +1218,12 @@ def _reset_mod_streak():
 def _vk_resets_modifier_streak(vk_code):
     return vk_code not in _get_all_modifier_vks()
 
+def _is_modifier_vk(vk_code):
+    """트리거/수식키(Shift·Ctrl·Alt·Win). prepare 취소 판별용."""
+    if vk_code in _get_all_modifier_vks():
+        return True
+    return vk_code in (VK_SHIFT, VK_CONTROL, VK_MENU, 0x5B, 0x5C)
+
 def _all_modifier_vks():
     vks = set()
     for group in MODIFIER_LL_VK.values():
@@ -1268,10 +1273,11 @@ def _ll_keyboard_proc(nCode, wParam, lParam):
     if _typo_phase == "executing":
         return 1
 
-    # 변환 준비 중: 새 키를 누르면 취소 가능 (키는 앱으로 통과)
+    # 변환 준비 중: 글자 등 비수식키만 취소 (Shift/Ctrl/Alt는 트리거라 취소하지 않음)
     if _typo_phase == "preparing":
         if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN) and not (kb.flags & LLKHF_REPEAT):
-            _request_typo_cancel(f"user key during prepare vk=0x{kb.vkCode:02X}")
+            if not _is_modifier_vk(kb.vkCode):
+                _request_typo_cancel(f"user key during prepare vk=0x{kb.vkCode:02X}")
         return user32.CallNextHookEx(_ll_hook_handle, nCode, wParam, lParam)
 
     if _typo_running:
@@ -1517,6 +1523,10 @@ def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=Non
             return
 
         release_all_modifiers()
+        if _is_typo_cancelled():
+            _debug_log("Cancelled during modifier release")
+            return
+
         # 실행 단계: 사용자 키 잠금 후 매크로
         _set_typo_phase("executing")
         _debug_log("Input locked, starting macro")
@@ -1671,11 +1681,20 @@ def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=Non
     except Exception as e:
         _debug_log(f"Exception: {e}")
     finally:
+        was_cancelled = _is_typo_cancelled()
         _set_typo_phase(None)
+        try:
+            release_all_modifiers()
+        except Exception:
+            pass
         _pressed_mods.clear()
         _reset_streak()
         _reset_mod_streak()
-        _last_typo_finish_time = time.time()
+        # 취소만 된 경우 쿨다운을 거의 안 줘서 "안 되는 것처럼" 쌓이지 않게 함
+        if was_cancelled:
+            _last_typo_finish_time = time.time() - TYPO_TRIGGER_COOLDOWN + 0.15
+        else:
+            _last_typo_finish_time = time.time()
         _typo_running = False
 
 def _debug_log(msg):
