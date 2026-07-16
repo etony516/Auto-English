@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 import pyperclip
 import converter
 
-APP_VERSION = "2.3.5"
+APP_VERSION = "2.3.8"
 
 # --- Win32 API ---
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -134,10 +134,11 @@ SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
-OVERLAY_POS_POLL_MS = 16
+OVERLAY_POS_POLL_MS = 8
 OVERLAY_IME_POLL_MS = 100
 OVERLAY_TOPMOST_REFRESH_SEC = 2.0
 OVERLAY_POS_MIN_DELTA = 2
+OVERLAY_SHOW_CHECK_SEC = 0.1
 
 if sys.maxsize > 2**32:
     GetWindowLong = user32.GetWindowLongPtrW
@@ -237,17 +238,24 @@ def _phantom_key_hook(event):
             
 keyboard.hook(_phantom_key_hook)
 
+_overlay_pos_dirty = False
+_overlay_latest_xy = None
+
 def _mouse_hook(event):
-    global _selection_active, _last_click_time, _mouse_down_pos, _phantom_buffer, _overlay_pos_dirty
+    global _selection_active, _last_click_time, _mouse_down_pos, _phantom_buffer
+    global _overlay_pos_dirty, _overlay_latest_xy
     if isinstance(event, mouse.MoveEvent):
         if app_state.get("overlay_enabled", False):
-            _overlay_pos_dirty = True
-            w = _overlay_widget_ref
-            if w is not None:
+            # 좌표만 저장. 창 이동은 고정 주기(_pos_loop)에서만 수행.
+            try:
+                _overlay_latest_xy = (int(event.x) + 15, int(event.y) + 15)
+            except Exception:
                 try:
-                    w.toplevel.after(0, w.refresh_position_now)
+                    mx, my = mouse.get_position()
+                    _overlay_latest_xy = (mx + 15, my + 15)
                 except Exception:
                     pass
+            _overlay_pos_dirty = True
         return
     if isinstance(event, mouse.ButtonEvent):
         if event.event_type == 'down' and event.button == 'middle':
@@ -301,7 +309,6 @@ def get_focused_hwnd():
 
 _overlay_exclude_hwnds = set()
 _overlay_widget_ref = None
-_overlay_pos_dirty = False
 
 def _hwnd_class_name(hwnd):
     if not hwnd:
@@ -1823,14 +1830,20 @@ class OverlayWidget:
         self._last_pos = None
         self._last_topmost_at = 0.0
         self._last_ime_tick = 0.0
+        self._last_show_check_at = 0.0
         self._visible = False
         self._ime_refresh_now = False
 
         _overlay_widget_ref = self
-        self.update_loop()
+        self._pos_loop()
+        self._ime_loop()
 
     def refresh_ime_now(self):
         self._ime_refresh_now = True
+        try:
+            self.toplevel.after(0, lambda: self._tick_ime(time.time()))
+        except Exception:
+            pass
 
     def refresh_position_now(self):
         if running:
@@ -1847,21 +1860,33 @@ class OverlayWidget:
             self.toplevel.attributes("-alpha", 0.8 if visible else 0.0)
 
     def _tick_position(self, now, force=False):
-        global _overlay_pos_dirty
+        global _overlay_pos_dirty, _overlay_latest_xy
+        dirty = force or _overlay_pos_dirty
+
+        # 정지 중에는 불필요한 창/IME 조회를 줄임
+        if not dirty and self._visible:
+            if (now - self._last_topmost_at) < OVERLAY_TOPMOST_REFRESH_SEC:
+                return
+        if not dirty and not self._visible:
+            if (now - self._last_show_check_at) < OVERLAY_SHOW_CHECK_SEC:
+                return
+            self._last_show_check_at = now
+
         if not self._should_show():
             self._set_visible(False)
             self._last_pos = None
+            _overlay_pos_dirty = False
             return
 
         self._set_visible(True)
-        pos = get_mouse_overlay_pos()
+
+        pos = _overlay_latest_xy if _overlay_latest_xy is not None else get_mouse_overlay_pos()
         if not pos:
             return
 
         x, y = pos
         moved = (
-            force
-            or _overlay_pos_dirty
+            dirty
             or self._last_pos is None
             or abs(x - self._last_pos[0]) > OVERLAY_POS_MIN_DELTA
             or abs(y - self._last_pos[1]) > OVERLAY_POS_MIN_DELTA
@@ -1869,6 +1894,7 @@ class OverlayWidget:
         need_topmost = (now - self._last_topmost_at) >= OVERLAY_TOPMOST_REFRESH_SEC
 
         if not moved and not need_topmost:
+            _overlay_pos_dirty = False
             return
 
         _overlay_pos_dirty = False
@@ -1916,21 +1942,26 @@ class OverlayWidget:
         shape = self._display_ime_state if self._display_ime_state is not None else ime_state
         self._apply_overlay_shape(shape)
 
-    def update_loop(self):
+    def _pos_loop(self):
         if not running:
             return
-
         try:
-            now = time.time()
-            self._tick_position(now)
-            if self._ime_refresh_now or (now - self._last_ime_tick) * 1000 >= OVERLAY_IME_POLL_MS:
-                self._ime_refresh_now = False
-                self._last_ime_tick = now
-                self._tick_ime(now)
+            self._tick_position(time.time())
         except Exception:
             pass
+        self.toplevel.after(OVERLAY_POS_POLL_MS, self._pos_loop)
 
-        self.toplevel.after(OVERLAY_POS_POLL_MS, self.update_loop)
+    def _ime_loop(self):
+        if not running:
+            return
+        try:
+            now = time.time()
+            self._ime_refresh_now = False
+            self._last_ime_tick = now
+            self._tick_ime(now)
+        except Exception:
+            pass
+        self.toplevel.after(OVERLAY_IME_POLL_MS, self._ime_loop)
 
     def _apply_overlay_shape(self, state):
         self.canvas.itemconfig(self.circle, state="hidden")
