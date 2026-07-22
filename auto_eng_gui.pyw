@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 import pyperclip
 import converter
 
-APP_VERSION = "2.3.8"
+APP_VERSION = "2.3.9"
 
 # --- Win32 API ---
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -109,6 +109,10 @@ imm32.ImmGetDefaultIMEWnd.argtypes = [wintypes.HWND]
 imm32.ImmGetDefaultIMEWnd.restype = wintypes.HWND
 imm32.ImmGetOpenStatus.argtypes = [wintypes.HANDLE]
 imm32.ImmGetOpenStatus.restype = wintypes.BOOL
+imm32.ImmSetConversionStatus.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD]
+imm32.ImmSetConversionStatus.restype = wintypes.BOOL
+imm32.ImmSetOpenStatus.argtypes = [wintypes.HANDLE, wintypes.BOOL]
+imm32.ImmSetOpenStatus.restype = wintypes.BOOL
 
 user32.GetKeyState.argtypes = [ctypes.c_int]
 user32.GetKeyState.restype = ctypes.c_short
@@ -687,49 +691,109 @@ def _clear_ime_display_cache():
     _ime_instant_fg_hwnd = None
     _invalidate_ime_read_cache()
 
-def set_ime_to_english():
-    """실제 IME(Imm)가 한글이면 영문으로 전환. SendMessage 우선, 미반영 시 si_tap."""
-    if _real_hangul_now() is False:
-        return
-    hwnd = get_focused_hwnd()
-    if hwnd:
-        try:
-            hime_wnd = imm32.ImmGetDefaultIMEWnd(hwnd)
-            if hime_wnd:
-                current_mode = user32.SendMessageW(hime_wnd, WM_IME_CONTROL, IMC_GETCONVERSIONMODE, 0)
-                if current_mode & IME_CMODE_HANGUL:
-                    new_mode = current_mode & ~IME_CMODE_HANGUL
-                    user32.SendMessageW(hime_wnd, WM_IME_CONTROL, IMC_SETCONVERSIONMODE, new_mode)
-        except Exception:
-            pass
+def _ime_target_hwnds():
+    if _is_chromium_foreground():
+        return _chrome_ime_hwnds_ordered()
+    hwnds = []
+    seen = set()
+    for hwnd, _ in _ime_hwnd_candidates_weighted():
+        if hwnd and hwnd not in seen:
+            seen.add(hwnd)
+            hwnds.append(hwnd)
+    focused = get_focused_hwnd()
+    if focused and focused not in seen:
+        hwnds.insert(0, focused)
+    return hwnds
+
+def _ime_set_conversion_on_hwnd(hwnd, want_hangul):
+    """단일 창에 한/영 모드 강제. 성공 여부(시도 여부)만 반환."""
+    if not hwnd:
+        return False
+    tried = False
+    try:
+        himc = imm32.ImmGetContext(hwnd)
+        if himc:
+            try:
+                imm32.ImmSetOpenStatus(himc, True)
+                conv = wintypes.DWORD()
+                sent = wintypes.DWORD()
+                if imm32.ImmGetConversionStatus(himc, ctypes.byref(conv), ctypes.byref(sent)):
+                    if want_hangul:
+                        conv.value = conv.value | IME_CMODE_HANGUL
+                    else:
+                        conv.value = conv.value & ~IME_CMODE_HANGUL
+                    imm32.ImmSetConversionStatus(himc, conv.value, sent.value)
+                    tried = True
+            finally:
+                imm32.ImmReleaseContext(hwnd, himc)
+        hime_wnd = imm32.ImmGetDefaultIMEWnd(hwnd)
+        if hime_wnd:
+            current_mode = user32.SendMessageW(hime_wnd, WM_IME_CONTROL, IMC_GETCONVERSIONMODE, 0)
+            if want_hangul:
+                new_mode = current_mode | IME_CMODE_HANGUL
+            else:
+                new_mode = current_mode & ~IME_CMODE_HANGUL
+            if new_mode != current_mode:
+                user32.SendMessageW(hime_wnd, WM_IME_CONTROL, IMC_SETCONVERSIONMODE, new_mode)
+            tried = True
+    except Exception:
+        return tried
+    return tried
+
+def _force_ime_mode(want_hangul):
+    """목표 한/영으로 맞춤. Chrome은 Imm 조기신뢰 금지(표시·실제 불일치 방지)."""
+    chromium = _is_chromium_foreground()
+    _invalidate_ime_read_cache()
+    before = _real_hangul_now()
+
+    # 일반 앱: 이미 맞으면 생략
+    if not chromium and before is not None and before == want_hangul:
+        return True
+
+    for hwnd in _ime_target_hwnds():
+        _ime_set_conversion_on_hwnd(hwnd, want_hangul)
     time.sleep(0.03)
     _invalidate_ime_read_cache()
-    if _real_hangul_now() is True:
+    after = _real_hangul_now()
+
+    # Chrome: Imm이 처음부터 목표와 같아도 실제 입력은 다를 수 있음 → 한/영 키로 한 번 흔든 뒤 재설정
+    if chromium and before is not None and before == want_hangul:
         si_tap(0x15)
+        time.sleep(0.04)
+        for hwnd in _ime_target_hwnds():
+            _ime_set_conversion_on_hwnd(hwnd, want_hangul)
         time.sleep(0.03)
-    _invalidate_ime_read_cache()
+        _invalidate_ime_read_cache()
+        after = _real_hangul_now()
+        if after is not None and after == want_hangul:
+            return True
+
+    if after is not None and after == want_hangul:
+        return True
+
+    for _ in range(2):
+        si_tap(0x15)
+        time.sleep(0.04)
+        _invalidate_ime_read_cache()
+        after = _real_hangul_now()
+        if after is not None and after == want_hangul:
+            return True
+        for hwnd in _ime_target_hwnds():
+            _ime_set_conversion_on_hwnd(hwnd, want_hangul)
+        time.sleep(0.03)
+        _invalidate_ime_read_cache()
+        after = _real_hangul_now()
+        if after is not None and after == want_hangul:
+            return True
+    return after is not None and after == want_hangul
+
+def set_ime_to_english():
+    """영문 입력 모드로 전환."""
+    return _force_ime_mode(False)
 
 def set_ime_to_hangul():
-    """실제 IME(Imm)가 영문이면 한글로 전환."""
-    if _real_hangul_now() is True:
-        return
-    hwnd = get_focused_hwnd()
-    if hwnd:
-        try:
-            hime_wnd = imm32.ImmGetDefaultIMEWnd(hwnd)
-            if hime_wnd:
-                current_mode = user32.SendMessageW(hime_wnd, WM_IME_CONTROL, IMC_GETCONVERSIONMODE, 0)
-                if not (current_mode & IME_CMODE_HANGUL):
-                    new_mode = current_mode | IME_CMODE_HANGUL
-                    user32.SendMessageW(hime_wnd, WM_IME_CONTROL, IMC_SETCONVERSIONMODE, new_mode)
-        except Exception:
-            pass
-    time.sleep(0.03)
-    _invalidate_ime_read_cache()
-    if _real_hangul_now() is False:
-        si_tap(0x15)
-        time.sleep(0.03)
-    _invalidate_ime_read_cache()
+    """한글 입력 모드로 전환."""
+    return _force_ime_mode(True)
 
 def get_mouse_overlay_pos():
     pt = POINT()
@@ -1539,24 +1603,47 @@ def on_typo_hotkey(pre_captured_text=None, trigger_source="unknown", pre_job=Non
         _debug_log("Input locked, starting macro")
 
         def _finish_convert(target_lang, orig_clip=None):
-            if target_lang == "hangul":
-                set_ime_to_hangul()
-            else:
-                set_ime_to_english()
+            want_hangul = target_lang == "hangul"
+            ok_ime = set_ime_to_hangul() if want_hangul else set_ime_to_english()
             time.sleep(0.05)
             _invalidate_ime_read_cache()
             real_after = _real_hangul_now()
-            if real_after is not None:
-                _apply_ime_instant_display(real_after)
             imm_after = _read_ime_hangul_imm()
             vk_after = _is_hangul_from_key_state()
+            # Chrome: Imm이 틀릴 수 있어 target으로 즉시 고정하지 않고, 재확인된 Imm만 표시
+            if _is_chromium_foreground():
+                _clear_ime_display_cache()
+                if real_after is not None and real_after == want_hangul:
+                    _apply_ime_instant_display(real_after)
+                else:
+                    _debug_log(
+                        f"Chrome IME mismatch after convert: target={target_lang} "
+                        f"ok={ok_ime} imm={'한글' if imm_after else '영어' if imm_after is not None else '?'}"
+                    )
+                    # 짧게 목표 표시 후 Imm 재조회로 교정
+                    _apply_ime_instant_display(want_hangul)
+                    def _chrome_ime_recheck():
+                        time.sleep(0.2)
+                        _invalidate_ime_read_cache()
+                        rh = _real_hangul_now()
+                        if rh is not None:
+                            _apply_ime_instant_display(rh)
+                        else:
+                            _clear_ime_display_cache()
+                            _notify_overlay_ime_refresh()
+                    threading.Thread(target=_chrome_ime_recheck, daemon=True).start()
+            else:
+                if real_after is not None:
+                    _apply_ime_instant_display(real_after)
             _debug_log(
                 f"Post-convert ({trigger_source}): target={target_lang} "
+                f"ok_ime={ok_ime} "
                 f"imm={'한글' if imm_after else '영어' if imm_after is not None else '?'} "
                 f"vk={'한글' if vk_after else '영어'} "
                 f"win={get_active_window_title()!r}"
             )
-            _clear_ime_display_cache()
+            if not _is_chromium_foreground():
+                _clear_ime_display_cache()
             update_tray_icon()
             _notify_overlay_ime_refresh()
             if orig_clip is not None:
